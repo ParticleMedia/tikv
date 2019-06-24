@@ -1274,7 +1274,7 @@ impl TiKvConfig {
             if self.coprocessor.region_split_size == default_coprocessor.region_split_size {
                 warn!(
                     "override coprocessor.region-split-size with raftstore.region-split-size, {:?}",
-                    self.raft_store.region_split_sizereadpool
+                    self.raft_store.region_split_size
                 );
                 self.coprocessor.region_split_size = self.raft_store.region_split_size;
             }

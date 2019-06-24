@@ -460,6 +460,15 @@ fn main() {
                      leaves it empty will disable Prometheus push",
                 ),
         )
+        .arg(
+            Arg::with_name("ttl")
+                .long("time-to-live")
+                .value_name("TTL")
+                .help("Set ttl for default cf")
+                .long_help(
+                    "Sets ttl in second for default cf, treat as infinite if ttl <= 0",
+                ),
+        )
         .get_matches();
 
     if matches.is_present("print-sample-config") {

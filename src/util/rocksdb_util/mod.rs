@@ -77,11 +77,15 @@ pub fn open_opt(
 pub struct CFOptions<'a> {
     cf: &'a str,
     options: ColumnFamilyOptions,
+    ttl: i32,
 }
 
 impl<'a> CFOptions<'a> {
     pub fn new(cf: &'a str, options: ColumnFamilyOptions) -> CFOptions<'a> {
-        CFOptions { cf, options }
+        CFOptions { cf, options, ttl: 0}
+    }
+    pub fn new_with_ttl(cf: &'a str, options: ColumnFamilyOptions, ttl: i32) -> CFOptions<'a> {
+        CFOptions { cf, options, ttl}
     }
 }
 
@@ -149,11 +153,13 @@ fn check_and_open(
 
         let mut cfs_v = vec![];
         let mut cf_opts_v = vec![];
+        let mut ttls = vec![];
         if let Some(x) = cfs_opts.iter().find(|x| x.cf == CF_DEFAULT) {
             cfs_v.push(x.cf);
             cf_opts_v.push(x.options.clone());
+            ttls.push(x.ttl);
         }
-        let mut db = DB::open_cf(db_opt, path, cfs_v.into_iter().zip(cf_opts_v).collect())?;
+        let mut db = DB::open_cf_with_ttl(db_opt, path, cfs_v.into_iter().zip(cf_opts_v).collect(), ttls.as_slice())?;
         for x in cfs_opts {
             if x.cf == CF_DEFAULT {
                 continue;
@@ -189,33 +195,38 @@ fn check_and_open(
     if existed == needed {
         let mut cfs_v = vec![];
         let mut cfs_opts_v = vec![];
+        let mut ttls = vec![];
         for mut x in cfs_opts {
             adjust_dynamic_level_bytes(&cf_descs, &mut x);
             cfs_v.push(x.cf);
             cfs_opts_v.push(x.options);
+            ttls.push(x.ttl);
         }
 
-        return DB::open_cf(db_opt, path, cfs_v.into_iter().zip(cfs_opts_v).collect());
+        return DB::open_cf_with_ttl(db_opt, path, cfs_v.into_iter().zip(cfs_opts_v).collect(), ttls.as_slice());
     }
 
     // Opens db.
     let mut cfs_v: Vec<&str> = Vec::new();
     let mut cfs_opts_v: Vec<ColumnFamilyOptions> = Vec::new();
+    let mut ttls: Vec<i32> = Vec::new();
     for cf in &existed {
         cfs_v.push(cf);
         match cfs_opts.iter().find(|x| x.cf == *cf) {
             Some(x) => {
-                let mut tmp = CFOptions::new(x.cf, x.options.clone());
+                let mut tmp = CFOptions::new_with_ttl(x.cf, x.options.clone(), x.ttl);
                 adjust_dynamic_level_bytes(&cf_descs, &mut tmp);
                 cfs_opts_v.push(tmp.options);
+                ttls.push(tmp.ttl);
             }
             None => {
                 cfs_opts_v.push(ColumnFamilyOptions::new());
+                ttls.push(0);
             }
         }
     }
     let cfds = cfs_v.into_iter().zip(cfs_opts_v).collect();
-    let mut db = DB::open_cf(db_opt, path, cfds).unwrap();
+    let mut db = DB::open_cf_with_ttl(db_opt, path, cfds, ttls.as_slice()).unwrap();
 
     // Drops discarded column families.
     //    for cf in existed.iter().filter(|x| needed.iter().find(|y| y == x).is_none()) {

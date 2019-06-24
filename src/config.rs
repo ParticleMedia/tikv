@@ -157,6 +157,7 @@ macro_rules! cf_config {
             pub soft_pending_compaction_bytes_limit: ReadableSize,
             pub hard_pending_compaction_bytes_limit: ReadableSize,
             pub titan: TitanCfConfig,
+            pub ttl: i32,
         }
     };
 }
@@ -357,6 +358,7 @@ impl Default for DefaultCfConfig {
             soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             titan: TitanCfConfig::default(),
+            ttl: 0,
         }
     }
 }
@@ -416,6 +418,7 @@ impl Default for WriteCfConfig {
             soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             titan,
+            ttl: 0,
         }
     }
 }
@@ -477,6 +480,7 @@ impl Default for LockCfConfig {
             soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             titan,
+            ttl: 0,
         }
     }
 }
@@ -531,6 +535,7 @@ impl Default for RaftCfConfig {
             soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             titan,
+            ttl: 0,
         }
     }
 }
@@ -710,7 +715,7 @@ impl DbConfig {
 
     pub fn build_cf_opts(&self) -> Vec<CFOptions<'_>> {
         vec![
-            CFOptions::new(CF_DEFAULT, self.defaultcf.build_opt()),
+            CFOptions::new_with_ttl(CF_DEFAULT, self.defaultcf.build_opt(), self.defaultcf.ttl),
             CFOptions::new(CF_LOCK, self.lockcf.build_opt()),
             CFOptions::new(CF_WRITE, self.writecf.build_opt()),
             // TODO: rmeove CF_RAFT.
@@ -720,7 +725,7 @@ impl DbConfig {
 
     pub fn build_cf_opts_v2(&self) -> Vec<CFOptions<'_>> {
         vec![
-            CFOptions::new(CF_DEFAULT, self.defaultcf.build_opt()),
+            CFOptions::new_with_ttl(CF_DEFAULT, self.defaultcf.build_opt(), self.defaultcf.ttl),
             CFOptions::new(CF_LOCK, self.lockcf.build_opt()),
             CFOptions::new(CF_WRITE, self.writecf.build_opt()),
             CFOptions::new(CF_RAFT, self.raftcf.build_opt()),
@@ -782,6 +787,7 @@ impl Default for RaftDefaultCfConfig {
             soft_pending_compaction_bytes_limit: ReadableSize::gb(64),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(256),
             titan: TitanCfConfig::default(),
+            ttl: 0,
         }
     }
 }

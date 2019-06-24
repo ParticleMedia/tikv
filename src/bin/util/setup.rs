@@ -147,4 +147,13 @@ pub fn overwrite_config_with_cmd_args(config: &mut TiKvConfig, matches: &ArgMatc
     if let Some(metrics_addr) = matches.value_of("metrics-addr") {
         config.metric.address = metrics_addr.to_owned()
     }
+
+    if let Some(ttl) = matches.value_of("ttl") {
+        let ttl_seconds: i32 = ttl
+            .trim()
+            .parse()
+            .expect("Want a integer");
+        config.rocksdb.defaultcf.ttl = ttl_seconds;
+        info!{"ttl for defaultcf: {}", config.rocksdb.defaultcf.ttl};
+    }
 }

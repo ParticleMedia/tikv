@@ -124,6 +124,7 @@ macro_rules! cf_config {
         #[serde(default)]
         #[serde(rename_all = "kebab-case")]
         pub struct $name {
+            pub ttl: i32,
             pub block_size: ReadableSize,
             pub block_cache_size: ReadableSize,
             pub disable_block_cache: bool,
@@ -157,7 +158,6 @@ macro_rules! cf_config {
             pub soft_pending_compaction_bytes_limit: ReadableSize,
             pub hard_pending_compaction_bytes_limit: ReadableSize,
             pub titan: TitanCfConfig,
-            pub ttl: i32,
         }
     };
 }
@@ -1274,7 +1274,7 @@ impl TiKvConfig {
             if self.coprocessor.region_split_size == default_coprocessor.region_split_size {
                 warn!(
                     "override coprocessor.region-split-size with raftstore.region-split-size, {:?}",
-                    self.raft_store.region_split_size
+                    self.raft_store.region_split_sizereadpool
                 );
                 self.coprocessor.region_split_size = self.raft_store.region_split_size;
             }

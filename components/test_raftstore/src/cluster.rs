@@ -1,7 +1,7 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::path::Path;
-use std::sync::{self, Arc, RwLock};
+use std::error::Error as StdError;
+use std::sync::{self, mpsc, Arc, RwLock};
 use std::time::*;
 use std::{result, thread};
 
@@ -11,21 +11,23 @@ use kvproto::metapb::{self, Peer, RegionEpoch};
 use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
 use kvproto::raft_serverpb::{RaftApplyState, RaftMessage, RaftTruncatedState};
-use tempdir::TempDir;
+use tempfile::{Builder, TempDir};
 
 use engine::rocks;
 use engine::rocks::DB;
 use engine::Engines;
 use engine::Peekable;
 use engine::CF_DEFAULT;
+use engine_rocks::RocksEngine;
+use pd_client::PdClient;
 use tikv::config::TiKvConfig;
-use tikv::pd::PdClient;
-use tikv::raftstore::store::fsm::{create_raft_batch_system, RaftBatchSystem, RaftRouter};
+use tikv::raftstore::store::fsm::{create_raft_batch_system, PeerFsm, RaftBatchSystem, RaftRouter};
 use tikv::raftstore::store::*;
 use tikv::raftstore::{Error, Result};
 use tikv::server::Result as ServerResult;
+use tikv::storage::config::DEFAULT_ROCKSDB_SUB_DIR;
 use tikv_util::collections::{HashMap, HashSet};
-use tikv_util::{escape, HandyRwLock};
+use tikv_util::HandyRwLock;
 
 use super::*;
 
@@ -54,7 +56,7 @@ pub trait Simulator {
         &self,
         node_id: u64,
         request: RaftCmdRequest,
-        cb: Callback,
+        cb: Callback<RocksEngine>,
     ) -> Result<()>;
     fn send_raft_msg(&mut self, msg: RaftMessage) -> Result<()>;
     fn get_snap_dir(&self, node_id: u64) -> String;
@@ -79,7 +81,7 @@ pub trait Simulator {
         match self.async_command_on_node(node_id, request, cb) {
             Ok(()) => {}
             Err(e) => {
-                let mut resp = RaftCmdResponse::new();
+                let mut resp = RaftCmdResponse::default();
                 resp.mut_header().set_error(e.into());
                 return Ok(resp);
             }
@@ -127,10 +129,18 @@ impl<T: Simulator> Cluster<T> {
         self.cfg.server.cluster_id
     }
 
+    pub fn pre_start_check(&mut self) -> result::Result<(), Box<dyn StdError>> {
+        for path in &self.paths {
+            self.cfg.storage.data_dir = path.path().to_str().unwrap().to_owned();
+            self.cfg.validate()?
+        }
+        Ok(())
+    }
+
     pub fn create_engines(&mut self) {
         for _ in 0..self.count {
-            let dir = TempDir::new("test_cluster").unwrap();
-            let kv_path = dir.path().join("kv");
+            let dir = Builder::new().prefix("test_cluster").tempdir().unwrap();
+            let kv_path = dir.path().join(DEFAULT_ROCKSDB_SUB_DIR);
             let cache = self.cfg.storage.block_cache.build_shared_cache();
             let kv_db_opt = self.cfg.rocksdb.build_opt();
             let kv_cfs_opt = self.cfg.rocksdb.build_cf_opts(&cache);
@@ -138,7 +148,7 @@ impl<T: Simulator> Cluster<T> {
                 rocks::util::new_engine_opt(kv_path.to_str().unwrap(), kv_db_opt, kv_cfs_opt)
                     .unwrap(),
             );
-            let raft_path = dir.path().join(Path::new("raft"));
+            let raft_path = dir.path().join("raft");
             let raft_engine = Arc::new(
                 rocks::util::new_engine(raft_path.to_str().unwrap(), None, &[CF_DEFAULT], None)
                     .unwrap(),
@@ -351,7 +361,7 @@ impl<T: Simulator> Cluster<T> {
         }
         self.reset_leader_of_region(region_id);
         let mut leader = None;
-        let mut leaders = HashMap::new();
+        let mut leaders = HashMap::default();
 
         let node_ids = self.sim.rl().get_node_ids();
         // For some tests, we stop the node but pd still has this information,
@@ -369,7 +379,7 @@ impl<T: Simulator> Cluster<T> {
                 };
                 leaders
                     .entry(l.get_id())
-                    .or_insert_with(|| (l, vec![]))
+                    .or_insert((l, vec![]))
                     .1
                     .push(*store_id);
             }
@@ -400,7 +410,7 @@ impl<T: Simulator> Cluster<T> {
     // But another node may request bootstrap at same time and get is_bootstrap false
     // Add Region but not set bootstrap to true
     pub fn add_first_region(&self) -> Result<()> {
-        let mut region = metapb::Region::new();
+        let mut region = metapb::Region::default();
         let region_id = self.pd_client.alloc_id().unwrap();
         let peer_id = self.pd_client.alloc_id().unwrap();
         region.set_id(region_id);
@@ -409,7 +419,7 @@ impl<T: Simulator> Cluster<T> {
         region.mut_region_epoch().set_version(INIT_EPOCH_VER);
         region.mut_region_epoch().set_conf_ver(INIT_EPOCH_CONF_VER);
         let peer = new_peer(peer_id, peer_id);
-        region.mut_peers().push(peer.clone());
+        region.mut_peers().push(peer);
         self.pd_client.add_region(&region);
         Ok(())
     }
@@ -423,7 +433,7 @@ impl<T: Simulator> Cluster<T> {
             self.engines.insert(id, engines.clone());
         }
 
-        let mut region = metapb::Region::new();
+        let mut region = metapb::Region::default();
         region.set_id(1);
         region.set_start_key(keys::EMPTY_KEY.to_vec());
         region.set_end_key(keys::EMPTY_KEY.to_vec());
@@ -621,7 +631,7 @@ impl<T: Simulator> Cluster<T> {
             sleep_ms(20);
         }
 
-        panic!("find no region for {:?}", escape(key));
+        panic!("find no region for {}", hex::encode_upper(key));
     }
 
     pub fn get_region(&self, key: &[u8]) -> metapb::Region {
@@ -832,7 +842,12 @@ impl<T: Simulator> Cluster<T> {
     // It's similar to `ask_split`, the difference is the msg, it sends, is `Msg::SplitRegion`,
     // and `region` will not be embedded to that msg.
     // Caller must ensure that the `split_key` is in the `region`.
-    pub fn split_region(&mut self, region: &metapb::Region, split_key: &[u8], cb: Callback) {
+    pub fn split_region(
+        &mut self,
+        region: &metapb::Region,
+        split_key: &[u8],
+        cb: Callback<RocksEngine>,
+    ) {
         let leader = self.leader_of_region(region.get_id()).unwrap();
         let router = self.sim.rl().get_router(leader.get_store_id()).unwrap();
         let split_key = split_key.to_vec();
@@ -841,7 +856,7 @@ impl<T: Simulator> Cluster<T> {
                 region.get_id(),
                 PeerMsg::CasualMessage(CasualMessage::SplitRegion {
                     region_epoch: region.get_region_epoch().clone(),
-                    split_keys: vec![split_key.clone()],
+                    split_keys: vec![split_key],
                     callback: cb,
                 }),
             )
@@ -887,10 +902,33 @@ impl<T: Simulator> Cluster<T> {
 
             if try_cnt > 250 {
                 panic!(
-                    "region {:?} has not been split by {:?}",
+                    "region {:?} has not been split by {}",
                     region,
-                    escape(split_key)
+                    hex::encode_upper(split_key)
                 );
+            }
+            try_cnt += 1;
+            sleep_ms(20);
+        }
+    }
+
+    pub fn wait_region_split(&mut self, region: &metapb::Region) {
+        let mut try_cnt = 0;
+        let split_count = self.pd_client.get_split_count();
+        loop {
+            if self.pd_client.get_split_count() > split_count {
+                match self.pd_client.get_region(region.get_start_key()) {
+                    Err(_) => {}
+                    Ok(left) => {
+                        if left.get_end_key() != region.get_end_key() {
+                            return;
+                        }
+                    }
+                };
+            }
+
+            if try_cnt > 250 {
+                panic!("region {:?} has not been split after 5000ms", region);
             }
             try_cnt += 1;
             sleep_ms(20);
@@ -956,7 +994,7 @@ impl<T: Simulator> Cluster<T> {
 
             if try_cnt > 250 {
                 panic!(
-                    "region {} doesn't exist on store {} after {} tries: {:?}",
+                    "region {} still exists on store {} after {} tries: {:?}",
                     region_id, store_id, try_cnt, resp
                 );
             }
@@ -992,6 +1030,25 @@ impl<T: Simulator> Cluster<T> {
     // it's so common that we provide an API for it
     pub fn partition(&self, s1: Vec<u64>, s2: Vec<u64>) {
         self.add_send_filter(PartitionFilterFactory::new(s1, s2));
+    }
+
+    // Request a snapshot on the given region.
+    pub fn must_request_snapshot(&self, store_id: u64, region_id: u64) -> u64 {
+        // Request snapshot.
+        let (request_tx, request_rx) = mpsc::channel();
+        let router = self.sim.rl().get_router(store_id).unwrap();
+        router
+            .send(
+                region_id,
+                PeerMsg::CasualMessage(CasualMessage::Test(Box::new(move |peer: &mut PeerFsm| {
+                    let idx = peer.peer.raft_group.get_store().committed_index();
+                    peer.peer.raft_group.request_snapshot(idx).unwrap();
+                    debug!("{} request snapshot at {}", idx, peer.peer.tag);
+                    request_tx.send(idx).unwrap();
+                }))),
+            )
+            .unwrap();
+        request_rx.recv_timeout(Duration::from_secs(5)).unwrap()
     }
 }
 

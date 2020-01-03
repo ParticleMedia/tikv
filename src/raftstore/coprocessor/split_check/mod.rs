@@ -9,6 +9,7 @@ use engine::rocks::DB;
 use kvproto::metapb::Region;
 use kvproto::pdpb::CheckPolicy;
 
+use super::config::Config;
 use super::error::Result;
 use super::{KeyEntry, ObserverContext, SplitChecker};
 
@@ -21,17 +22,18 @@ pub use self::size::{
 };
 pub use self::table::TableCheckObserver;
 
-#[derive(Default)]
-pub struct Host {
+pub struct Host<'a> {
     checkers: Vec<Box<dyn SplitChecker>>,
     auto_split: bool,
+    cfg: &'a Config,
 }
 
-impl Host {
-    pub fn new(auto_split: bool) -> Host {
+impl<'a> Host<'a> {
+    pub fn new(auto_split: bool, cfg: &'a Config) -> Host<'a> {
         Host {
             auto_split,
             checkers: vec![],
+            cfg,
         }
     }
 
@@ -47,11 +49,11 @@ impl Host {
 
     pub fn policy(&self) -> CheckPolicy {
         for checker in &self.checkers {
-            if checker.policy() == CheckPolicy::APPROXIMATE {
-                return CheckPolicy::APPROXIMATE;
+            if checker.policy() == CheckPolicy::Approximate {
+                return CheckPolicy::Approximate;
             }
         }
-        CheckPolicy::SCAN
+        CheckPolicy::Scan
     }
 
     /// Hook to call for every check during split.

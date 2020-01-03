@@ -1,14 +1,11 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::ops::Bound::Excluded;
-
 use engine::rocks::DB;
 use engine::util;
 use engine::{CF_DEFAULT, CF_WRITE};
 use kvproto::metapb::Region;
 use kvproto::pdpb::CheckPolicy;
 
-use crate::raftstore::store::keys;
 use tikv_util::config::ReadableSize;
 
 use super::super::error::Result;
@@ -71,24 +68,7 @@ impl SplitChecker for Checker {
     }
 }
 
-pub struct HalfCheckObserver {
-    half_split_bucket_size: u64,
-}
-
-impl HalfCheckObserver {
-    pub fn new(region_size_limit: u64) -> HalfCheckObserver {
-        let mut half_split_bucket_size = region_size_limit / BUCKET_NUMBER_LIMIT as u64;
-        let bucket_size_limit = ReadableSize::mb(BUCKET_SIZE_LIMIT_MB).0;
-        if half_split_bucket_size == 0 {
-            half_split_bucket_size = 1;
-        } else if half_split_bucket_size > bucket_size_limit {
-            half_split_bucket_size = bucket_size_limit;
-        }
-        HalfCheckObserver {
-            half_split_bucket_size,
-        }
-    }
-}
+pub struct HalfCheckObserver;
 
 impl Coprocessor for HalfCheckObserver {}
 
@@ -103,8 +83,22 @@ impl SplitCheckObserver for HalfCheckObserver {
         if host.auto_split() {
             return;
         }
-        host.add_checker(Box::new(Checker::new(self.half_split_bucket_size, policy)))
+        host.add_checker(Box::new(Checker::new(
+            half_split_bucket_size(host.cfg.region_max_size.0),
+            policy,
+        )))
     }
+}
+
+fn half_split_bucket_size(region_max_size: u64) -> u64 {
+    let mut half_split_bucket_size = region_max_size / BUCKET_NUMBER_LIMIT as u64;
+    let bucket_size_limit = ReadableSize::mb(BUCKET_SIZE_LIMIT_MB).0;
+    if half_split_bucket_size == 0 {
+        half_split_bucket_size = 1;
+    } else if half_split_bucket_size > bucket_size_limit {
+        half_split_bucket_size = bucket_size_limit;
+    }
+    half_split_bucket_size
 }
 
 /// Get region approximate middle key based on default and write cf size.
@@ -145,9 +139,9 @@ fn get_region_approximate_middle_cf(
         let props = box_try!(RangeProperties::decode(v.user_collected_properties()));
         keys.extend(
             props
-                .offsets
-                .range::<[u8], _>((Excluded(start_key.as_slice()), Excluded(end_key.as_slice())))
-                .map(|(k, _)| k.to_owned()),
+                .take_excluded_range(start_key.as_slice(), end_key.as_slice())
+                .into_iter()
+                .map(|(k, _)| k),
         );
     }
     if keys.is_empty() {
@@ -174,16 +168,14 @@ mod tests {
     use kvproto::metapb::Peer;
     use kvproto::metapb::Region;
     use kvproto::pdpb::CheckPolicy;
-    use tempdir::TempDir;
+    use tempfile::Builder;
 
-    use crate::raftstore::coprocessor::properties::{
-        RangePropertiesCollectorFactory, SizePropertiesCollectorFactory,
-    };
-    use crate::raftstore::store::{keys, SplitCheckRunner, SplitCheckTask};
-    use crate::storage::Key;
+    use crate::raftstore::coprocessor::properties::RangePropertiesCollectorFactory;
+    use crate::raftstore::store::{SplitCheckRunner, SplitCheckTask};
     use tikv_util::config::ReadableSize;
     use tikv_util::escape;
     use tikv_util::worker::Runnable;
+    use txn_types::Key;
 
     use super::super::size::tests::must_split_at;
     use super::*;
@@ -191,23 +183,23 @@ mod tests {
 
     #[test]
     fn test_split_check() {
-        let path = TempDir::new("test-raftstore").unwrap();
+        let path = Builder::new().prefix("test-raftstore").tempdir().unwrap();
         let path_str = path.path().to_str().unwrap();
         let db_opts = DBOptions::new();
         let cfs_opts = ALL_CFS
             .iter()
             .map(|cf| {
                 let mut cf_opts = ColumnFamilyOptions::new();
-                let f = Box::new(SizePropertiesCollectorFactory::default());
+                let f = Box::new(RangePropertiesCollectorFactory::default());
                 cf_opts.add_table_properties_collector_factory("tikv.size-collector", f);
                 CFOptions::new(cf, cf_opts)
             })
             .collect();
         let engine = Arc::new(new_engine_opt(path_str, db_opts, cfs_opts).unwrap());
 
-        let mut region = Region::new();
+        let mut region = Region::default();
         region.set_id(1);
-        region.mut_peers().push(Peer::new());
+        region.mut_peers().push(Peer::default());
         region.mut_region_epoch().set_version(2);
         region.mut_region_epoch().set_conf_ver(5);
 
@@ -217,7 +209,8 @@ mod tests {
         let mut runnable = SplitCheckRunner::new(
             Arc::clone(&engine),
             tx.clone(),
-            Arc::new(CoprocessorHost::new(cfg, tx.clone())),
+            Arc::new(CoprocessorHost::new(tx)),
+            cfg,
         );
 
         // so split key will be z0005
@@ -229,24 +222,27 @@ mod tests {
             // Flush for every key so that we can know the exact middle key.
             engine.flush_cf(cf_handle, true).unwrap();
         }
-        runnable.run(SplitCheckTask::new(
+        runnable.run(SplitCheckTask::split_check(
             region.clone(),
             false,
-            CheckPolicy::SCAN,
+            CheckPolicy::Scan,
         ));
         let split_key = Key::from_raw(b"0005");
         must_split_at(&rx, &region, vec![split_key.clone().into_encoded()]);
-        runnable.run(SplitCheckTask::new(
+        runnable.run(SplitCheckTask::split_check(
             region.clone(),
             false,
-            CheckPolicy::APPROXIMATE,
+            CheckPolicy::Approximate,
         ));
         must_split_at(&rx, &region, vec![split_key.into_encoded()]);
     }
 
     #[test]
     fn test_get_region_approximate_middle_cf() {
-        let tmp = TempDir::new("test_raftstore_util").unwrap();
+        let tmp = Builder::new()
+            .prefix("test_raftstore_util")
+            .tempdir()
+            .unwrap();
         let path = tmp.path().to_str().unwrap();
 
         let db_opts = DBOptions::new();
@@ -271,8 +267,8 @@ mod tests {
             engine.flush_cf(cf_handle, true).unwrap();
         }
 
-        let mut region = Region::new();
-        region.mut_peers().push(Peer::new());
+        let mut region = Region::default();
+        region.mut_peers().push(Peer::default());
         let middle_key = get_region_approximate_middle_cf(&engine, CF_DEFAULT, &region)
             .unwrap()
             .unwrap();

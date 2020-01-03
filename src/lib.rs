@@ -21,13 +21,14 @@
 #![recursion_limit = "200"]
 #![feature(cell_update)]
 #![feature(proc_macro_hygiene)]
-#![feature(duration_float)]
 #![feature(specialization)]
 #![feature(const_fn)]
+#![feature(box_patterns)]
+#![feature(shrink_to)]
 
 #[macro_use]
 extern crate bitflags;
-#[macro_use]
+#[macro_use(fail_point)]
 extern crate fail;
 #[macro_use]
 extern crate lazy_static;
@@ -37,21 +38,6 @@ extern crate prometheus;
 extern crate quick_error;
 #[macro_use]
 extern crate serde_derive;
-#[macro_use(
-    kv,
-    slog_kv,
-    slog_trace,
-    slog_error,
-    slog_warn,
-    slog_info,
-    slog_debug,
-    slog_crit,
-    slog_log,
-    slog_record,
-    slog_b,
-    slog_record_static
-)]
-extern crate slog;
 #[macro_use]
 extern crate slog_derive;
 #[macro_use]
@@ -65,15 +51,46 @@ extern crate vlog;
 #[macro_use]
 extern crate tikv_util;
 #[macro_use]
-extern crate match_template;
+extern crate failure;
+
 #[cfg(test)]
 extern crate test;
 
-pub mod binutil;
 pub mod config;
 pub mod coprocessor;
 pub mod import;
-pub mod pd;
+pub mod into_other;
 pub mod raftstore;
 pub mod server;
 pub mod storage;
+
+/// Returns the tikv version information.
+pub fn tikv_version_info() -> String {
+    let fallback = "Unknown (env var does not exist when building)";
+    format!(
+        "\nRelease Version:   {}\
+         \nGit Commit Hash:   {}\
+         \nGit Commit Branch: {}\
+         \nUTC Build Time:    {}\
+         \nRust Version:      {}\
+         \nEnable Features:   {}\
+         \nProfile:           {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("TIKV_BUILD_GIT_HASH").unwrap_or(fallback),
+        option_env!("TIKV_BUILD_GIT_BRANCH").unwrap_or(fallback),
+        option_env!("TIKV_BUILD_TIME").unwrap_or(fallback),
+        option_env!("TIKV_BUILD_RUSTC_VERSION").unwrap_or(fallback),
+        option_env!("TIKV_ENABLE_FEATURES")
+            .unwrap_or(fallback)
+            .trim(),
+        option_env!("TIKV_PROFILE").unwrap_or(fallback),
+    )
+}
+
+/// Prints the tikv version information to the standard output.
+pub fn log_tikv_info() {
+    info!("Welcome to TiKV");
+    for line in tikv_version_info().lines() {
+        info!("{}", line);
+    }
+}

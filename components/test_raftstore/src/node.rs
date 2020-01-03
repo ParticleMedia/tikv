@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tempdir::TempDir;
+use tempfile::{Builder, TempDir};
 
 use kvproto::metapb;
 use kvproto::raft_cmdpb::*;
@@ -12,13 +12,14 @@ use raft::eraftpb::MessageType;
 use raft::SnapshotStatus;
 
 use engine::*;
-use tikv::config::TiKvConfig;
+use engine_rocks::RocksEngine;
+use tikv::config::{ConfigController, TiKvConfig};
 use tikv::import::SSTImporter;
 use tikv::raftstore::coprocessor::CoprocessorHost;
+use tikv::raftstore::router::{RaftStoreRouter, ServerRaftStoreRouter};
 use tikv::raftstore::store::fsm::{RaftBatchSystem, RaftRouter};
 use tikv::raftstore::store::*;
 use tikv::raftstore::Result;
-use tikv::server::transport::{RaftStoreRouter, ServerRaftStoreRouter};
 use tikv::server::Node;
 use tikv::server::Result as ServerResult;
 use tikv_util::collections::{HashMap, HashSet};
@@ -28,7 +29,7 @@ use super::*;
 use tikv::raftstore::store::fsm::store::{StoreMeta, PENDING_VOTES_CAP};
 
 pub struct ChannelTransportCore {
-    snap_paths: HashMap<u64, (SnapManager, TempDir)>,
+    snap_paths: HashMap<u64, (SnapManager<RocksEngine>, TempDir)>,
     routers: HashMap<u64, SimulateTransport<ServerRaftStoreRouter>>,
 }
 
@@ -151,6 +152,10 @@ impl NodeCluster {
     pub fn post_create_coprocessor_host(&mut self, op: Box<dyn Fn(u64, &mut CoprocessorHost)>) {
         self.post_create_coprocessor_host = Some(op)
     }
+
+    pub fn get_node(&mut self, node_id: u64) -> Option<&mut Node<TestPdClient>> {
+        self.nodes.get_mut(&node_id)
+    }
 }
 
 impl Simulator for NodeCluster {
@@ -182,7 +187,7 @@ impl Simulator for NodeCluster {
                 .snap_paths
                 .contains_key(&node_id)
         {
-            let tmp = TempDir::new("test_cluster").unwrap();
+            let tmp = Builder::new().prefix("test_cluster").tempdir().unwrap();
             let snap_mgr = SnapManager::new(tmp.path().to_str().unwrap(), Some(router.clone()));
             (snap_mgr, Some(tmp))
         } else {
@@ -192,7 +197,7 @@ impl Simulator for NodeCluster {
         };
 
         // Create coprocessor.
-        let mut coprocessor_host = CoprocessorHost::new(cfg.coprocessor, router.clone());
+        let mut coprocessor_host = CoprocessorHost::new(router.clone());
 
         if let Some(f) = self.post_create_coprocessor_host.as_ref() {
             f(node_id, &mut coprocessor_host);
@@ -205,6 +210,7 @@ impl Simulator for NodeCluster {
 
         let store_meta = Arc::new(Mutex::new(StoreMeta::new(PENDING_VOTES_CAP)));
         let local_reader = LocalReader::new(engines.kv.clone(), store_meta.clone(), router.clone());
+        let cfg_controller = ConfigController::new(cfg, Default::default());
         node.start(
             engines.clone(),
             simulate_trans.clone(),
@@ -213,6 +219,7 @@ impl Simulator for NodeCluster {
             store_meta,
             coprocessor_host,
             importer,
+            cfg_controller,
         )?;
         assert!(engines
             .kv
@@ -281,7 +288,7 @@ impl Simulator for NodeCluster {
         &self,
         node_id: u64,
         request: RaftCmdRequest,
-        cb: Callback,
+        cb: Callback<RocksEngine>,
     ) -> Result<()> {
         if !self
             .trans

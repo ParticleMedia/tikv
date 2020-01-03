@@ -10,7 +10,6 @@ use crossbeam::TrySendError;
 use kvproto::errorpb;
 use kvproto::metapb;
 use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse};
-use prometheus::local::LocalHistogram;
 use time::Timespec;
 
 use crate::raftstore::errors::RAFTSTORE_IS_BUSY;
@@ -22,6 +21,7 @@ use crate::raftstore::store::{
 };
 use crate::raftstore::Result;
 use engine::DB;
+use engine_rocks::{Compat, RocksEngine};
 use tikv_util::collections::HashMap;
 use tikv_util::time::Instant;
 
@@ -84,9 +84,9 @@ impl ReadDelegate {
     fn handle_read(
         &self,
         req: &RaftCmdRequest,
-        executor: &mut ReadExecutor,
+        executor: &mut ReadExecutor<RocksEngine>,
         metrics: &mut ReadMetrics,
-    ) -> Option<ReadResponse> {
+    ) -> Option<ReadResponse<RocksEngine>> {
         if let Some(ref lease) = self.leader_lease {
             let term = lease.term();
             if term == self.term {
@@ -186,7 +186,7 @@ impl<C: ProposalRouter> LocalReader<C> {
     fn redirect(&self, mut cmd: RaftCommand) {
         debug!("localreader redirects command"; "tag" => &self.tag, "command" => ?cmd);
         let region_id = cmd.request.get_header().get_region_id();
-        let mut err = errorpb::Error::new();
+        let mut err = errorpb::Error::default();
         match self.router.send(cmd) {
             Ok(()) => return,
             Err(TrySendError::Full(c)) => {
@@ -204,7 +204,7 @@ impl<C: ProposalRouter> LocalReader<C> {
             }
         }
 
-        let mut resp = RaftCmdResponse::new();
+        let mut resp = RaftCmdResponse::default();
         resp.mut_header().set_error(err);
         let read_resp = ReadResponse {
             response: resp,
@@ -291,7 +291,7 @@ impl<C: ProposalRouter> LocalReader<C> {
     pub fn propose_raft_command(&self, cmd: RaftCommand) {
         let region_id = cmd.request.get_header().get_region_id();
         let mut executor = ReadExecutor::new(
-            self.kv_engine.clone(),
+            self.kv_engine.c().clone(),
             false, /* dont check region epoch */
             true,  /* we need snapshot time */
         );
@@ -307,6 +307,7 @@ impl<C: ProposalRouter> LocalReader<C> {
                         self.delegates
                             .borrow_mut()
                             .insert(region_id, Some(delegate));
+                        metrics.local_executed_requests += 1;
                         return;
                     }
                     break;
@@ -369,7 +370,7 @@ impl<C: ProposalRouter> LocalReader<C> {
                     | CmdType::Put
                     | CmdType::DeleteRange
                     | CmdType::Prewrite
-                    | CmdType::IngestSST
+                    | CmdType::IngestSst
                     | CmdType::ReadIndex
                     | CmdType::Invalid => return false,
                 }
@@ -431,9 +432,7 @@ const METRICS_FLUSH_INTERVAL: u64 = 15_000; // 15s
 
 #[derive(Clone)]
 struct ReadMetrics {
-    requests_wait_duration: LocalHistogram,
-    batch_requests_size: LocalHistogram,
-
+    local_executed_requests: i64,
     // TODO: record rejected_by_read_quorum.
     rejected_by_store_id_mismatch: i64,
     rejected_by_peer_id_mismatch: i64,
@@ -452,8 +451,7 @@ struct ReadMetrics {
 impl Default for ReadMetrics {
     fn default() -> ReadMetrics {
         ReadMetrics {
-            requests_wait_duration: LOCAL_READ_WAIT_DURATION.local(),
-            batch_requests_size: LOCAL_READ_BATCH_REQUESTS.local(),
+            local_executed_requests: 0,
             rejected_by_store_id_mismatch: 0,
             rejected_by_peer_id_mismatch: 0,
             rejected_by_term_mismatch: 0,
@@ -478,8 +476,6 @@ impl ReadMetrics {
     }
 
     fn flush(&mut self) {
-        self.requests_wait_duration.flush();
-        self.batch_requests_size.flush();
         if self.rejected_by_store_id_mismatch > 0 {
             LOCAL_READ_REJECT
                 .with_label_values(&["store_id_mismatch"])
@@ -534,11 +530,9 @@ impl ReadMetrics {
                 .inc_by(self.rejected_by_channel_full);
             self.rejected_by_channel_full = 0;
         }
-        if self.rejected_by_cache_miss > 0 {
-            LOCAL_READ_REJECT
-                .with_label_values(&["cache_miss"])
-                .inc_by(self.rejected_by_cache_miss);
-            self.rejected_by_cache_miss = 0;
+        if self.local_executed_requests > 0 {
+            LOCAL_READ_EXECUTED_REQUESTS.inc_by(self.local_executed_requests);
+            self.local_executed_requests = 0;
         }
     }
 }
@@ -549,7 +543,7 @@ mod tests {
     use std::thread;
 
     use kvproto::raft_cmdpb::*;
-    use tempdir::TempDir;
+    use tempfile::{Builder, TempDir};
     use time::Duration;
 
     use crate::raftstore::store::util::Lease;
@@ -569,7 +563,7 @@ mod tests {
         LocalReader<SyncSender<RaftCommand>>,
         Receiver<RaftCommand>,
     ) {
-        let path = TempDir::new(path).unwrap();
+        let path = Builder::new().prefix(path).tempdir().unwrap();
         let db =
             rocks::util::new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap();
         let (ch, rx) = sync_channel(1);
@@ -589,7 +583,7 @@ mod tests {
         pr_ids
             .into_iter()
             .map(|id| {
-                let mut pr = metapb::Peer::new();
+                let mut pr = metapb::Peer::default();
                 pr.set_store_id(store_id);
                 pr.set_id(id);
                 pr
@@ -638,12 +632,12 @@ mod tests {
         // from "" to "",
         // epoch 1, 1,
         // term 6.
-        let mut region1 = metapb::Region::new();
+        let mut region1 = metapb::Region::default();
         region1.set_id(1);
         let prs = new_peers(store_id, vec![2, 3, 4]);
         region1.set_peers(prs.clone().into());
         let epoch13 = {
-            let mut ep = metapb::RegionEpoch::new();
+            let mut ep = metapb::RegionEpoch::default();
             ep.set_conf_ver(1);
             ep.set_version(3);
             ep
@@ -653,14 +647,14 @@ mod tests {
         let term6 = 6;
         let mut lease = Lease::new(Duration::seconds(1)); // 1s is long enough.
 
-        let mut cmd = RaftCmdRequest::new();
-        let mut header = RaftRequestHeader::new();
+        let mut cmd = RaftCmdRequest::default();
+        let mut header = RaftRequestHeader::default();
         header.set_region_id(1);
         header.set_peer(leader2.clone());
         header.set_region_epoch(epoch13.clone());
         header.set_term(term6);
         cmd.set_header(header);
-        let mut req = Request::new();
+        let mut req = Request::default();
         req.set_cmd_type(CmdType::Snap);
         cmd.set_requests(vec![req].into());
 
@@ -705,10 +699,10 @@ mod tests {
         assert_eq!(reader.metrics.borrow().rejected_by_cache_miss, 3);
 
         // Let's read.
-        let region = region1.clone();
+        let region = region1;
         let task = RaftCommand::new(
             cmd.clone(),
-            Callback::Read(Box::new(move |resp: ReadResponse| {
+            Callback::Read(Box::new(move |resp: ReadResponse<RocksEngine>| {
                 let snap = resp.snapshot.unwrap();
                 assert_eq!(snap.get_region(), &region);
             })),
@@ -731,7 +725,7 @@ mod tests {
             .set_store_id(store_id + 1);
         let task = RaftCommand::new(
             cmd_store_id,
-            Callback::Read(Box::new(move |resp: ReadResponse| {
+            Callback::Read(Box::new(move |resp: ReadResponse<RocksEngine>| {
                 let err = resp.response.get_header().get_error();
                 assert!(err.has_store_not_match());
                 assert!(resp.snapshot.is_none());
@@ -749,7 +743,7 @@ mod tests {
             .set_id(leader2.get_id() + 1);
         let task = RaftCommand::new(
             cmd_peer_id,
-            Callback::Read(Box::new(move |resp: ReadResponse| {
+            Callback::Read(Box::new(move |resp: ReadResponse<RocksEngine>| {
                 assert!(
                     resp.response.get_header().has_error(),
                     "{:?}",
@@ -773,7 +767,7 @@ mod tests {
         cmd_term.mut_header().set_term(term6 - 2);
         let task = RaftCommand::new(
             cmd_term,
-            Callback::Read(Box::new(move |resp: ReadResponse| {
+            Callback::Read(Box::new(move |resp: ReadResponse<RocksEngine>| {
                 let err = resp.response.get_header().get_error();
                 assert!(err.has_stale_command(), "{:?}", resp);
                 assert!(resp.snapshot.is_none());
@@ -784,7 +778,7 @@ mod tests {
         assert_eq!(reader.metrics.borrow().rejected_by_cache_miss, 6);
 
         // Stale epoch.
-        let mut epoch12 = epoch13.clone();
+        let mut epoch12 = epoch13;
         epoch12.set_version(2);
         let mut cmd_epoch = cmd.clone();
         cmd_epoch.mut_header().set_region_epoch(epoch12);
@@ -807,7 +801,7 @@ mod tests {
         let task1 = RaftCommand::new(cmd.clone(), Callback::None);
         let task_full = RaftCommand::new(
             cmd.clone(),
-            Callback::Read(Box::new(move |resp: ReadResponse| {
+            Callback::Read(Box::new(move |resp: ReadResponse<RocksEngine>| {
                 let err = resp.response.get_header().get_error();
                 assert!(err.has_server_is_busy(), "{:?}", resp);
                 assert!(resp.snapshot.is_none());
@@ -821,7 +815,7 @@ mod tests {
 
         // Reject by term mismatch in lease.
         let previous_term_rejection = reader.metrics.borrow().rejected_by_term_mismatch;
-        let mut cmd9 = cmd.clone();
+        let mut cmd9 = cmd;
         cmd9.mut_header().set_term(term6 + 3);
         let task = RaftCommand::new(
             cmd9.clone(),

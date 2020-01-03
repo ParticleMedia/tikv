@@ -2,8 +2,9 @@
 
 use super::*;
 
-use tikv::coprocessor::codec::{datum, Datum};
-use tipb::schema::ColumnInfo;
+use tidb_query::codec::{datum, Datum};
+use tidb_query::expr::EvalContext;
+use tipb::ColumnInfo;
 
 pub const TYPE_VAR_CHAR: i32 = 1;
 pub const TYPE_LONG: i32 = 2;
@@ -19,12 +20,14 @@ pub struct Column {
 
 impl Column {
     pub fn as_column_info(&self) -> ColumnInfo {
-        let mut c_info = ColumnInfo::new();
+        let mut c_info = ColumnInfo::default();
         c_info.set_column_id(self.id);
         c_info.set_tp(self.col_type);
         c_info.set_pk_handle(self.index == 0);
         if let Some(ref dv) = self.default_val {
-            c_info.set_default_val(datum::encode_value(&[dv.clone()]).unwrap())
+            c_info.set_default_val(
+                datum::encode_value(&mut EvalContext::default(), &[dv.clone()]).unwrap(),
+            )
         }
         c_info
     }

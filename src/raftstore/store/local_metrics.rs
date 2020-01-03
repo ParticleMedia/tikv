@@ -71,6 +71,7 @@ pub struct RaftMessageMetrics {
     pub vote: u64,
     pub vote_resp: u64,
     pub snapshot: u64,
+    pub request_snapshot: u64,
     pub heartbeat: u64,
     pub heartbeat_resp: u64,
     pub transfer_leader: u64,
@@ -122,6 +123,12 @@ impl RaftMessageMetrics {
                 .with_label_values(&["snapshot"])
                 .inc_by(self.snapshot as i64);
             self.snapshot = 0;
+        }
+        if self.request_snapshot > 0 {
+            STORE_RAFT_SENT_MESSAGE_COUNTER_VEC
+                .with_label_values(&["request_snapshot"])
+                .inc_by(self.request_snapshot as i64);
+            self.request_snapshot = 0;
         }
         if self.heartbeat > 0 {
             STORE_RAFT_SENT_MESSAGE_COUNTER_VEC
@@ -302,6 +309,9 @@ pub struct RaftInvalidProposeMetrics {
     pub mismatch_peer_id: u64,
     pub stale_command: u64,
     pub epoch_not_match: u64,
+    pub read_index_no_leader: u64,
+    pub region_not_initialized: u64,
+    pub is_applying_snapshot: u64,
 }
 
 impl Default for RaftInvalidProposeMetrics {
@@ -313,6 +323,9 @@ impl Default for RaftInvalidProposeMetrics {
             mismatch_peer_id: 0,
             stale_command: 0,
             epoch_not_match: 0,
+            read_index_no_leader: 0,
+            region_not_initialized: 0,
+            is_applying_snapshot: 0,
         }
     }
 }
@@ -355,6 +368,24 @@ impl RaftInvalidProposeMetrics {
                 .inc_by(self.epoch_not_match as i64);
             self.epoch_not_match = 0;
         }
+        if self.read_index_no_leader > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["read_index_no_leader"])
+                .inc_by(self.read_index_no_leader as i64);
+            self.read_index_no_leader = 0;
+        }
+        if self.region_not_initialized > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["region_not_initialized"])
+                .inc_by(self.region_not_initialized as i64);
+            self.region_not_initialized = 0;
+        }
+        if self.is_applying_snapshot > 0 {
+            RAFT_INVALID_PROPOSAL_COUNTER_VEC
+                .with_label_values(&["is_applying_snapshot"])
+                .inc_by(self.is_applying_snapshot as i64);
+            self.is_applying_snapshot = 0;
+        }
     }
 }
 /// The buffered metrics counters for raft.
@@ -366,6 +397,7 @@ pub struct RaftMetrics {
     pub propose: RaftProposeMetrics,
     pub process_ready: LocalHistogram,
     pub append_log: LocalHistogram,
+    pub commit_log: LocalHistogram,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
     pub invalid_proposal: RaftInvalidProposeMetrics,
 }
@@ -381,6 +413,7 @@ impl Default for RaftMetrics {
                 .with_label_values(&["ready"])
                 .local(),
             append_log: PEER_APPEND_LOG_HISTOGRAM.local(),
+            commit_log: PEER_COMMIT_LOG_HISTOGRAM.local(),
             leader_missing: Arc::default(),
             invalid_proposal: Default::default(),
         }
@@ -395,6 +428,7 @@ impl RaftMetrics {
         self.propose.flush();
         self.process_ready.flush();
         self.append_log.flush();
+        self.commit_log.flush();
         self.message_dropped.flush();
         self.invalid_proposal.flush();
         let mut missing = self.leader_missing.lock().unwrap();

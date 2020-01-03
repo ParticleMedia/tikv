@@ -1,10 +1,10 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine::rocks::DB;
+use engine::CfName;
 use kvproto::metapb::Region;
 use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{AdminRequest, AdminResponse, Request, Response};
-use protobuf::RepeatedField;
 use raft::StateRole;
 
 pub mod config;
@@ -19,7 +19,10 @@ pub mod split_observer;
 pub use self::config::Config;
 pub use self::dispatcher::{CoprocessorHost, Registry};
 pub use self::error::{Error, Result};
-pub use self::region_info_accessor::{RegionInfo, RegionInfoAccessor, SeekRegionCallback};
+pub use self::region_info_accessor::{
+    Callback as RegionInfoCallback, RegionCollector, RegionInfo, RegionInfoAccessor,
+    SeekRegionCallback,
+};
 pub use self::split_check::{
     get_region_approximate_keys, get_region_approximate_keys_cf, get_region_approximate_middle,
     get_region_approximate_size, get_region_approximate_size_cf, HalfCheckObserver,
@@ -72,11 +75,7 @@ pub trait QueryObserver: Coprocessor {
     /// Hook to call before proposing write request.
     ///
     /// We don't propose read request, hence there is no hook for it yet.
-    fn pre_propose_query(
-        &self,
-        _: &mut ObserverContext<'_>,
-        _: &mut RepeatedField<Request>,
-    ) -> Result<()> {
+    fn pre_propose_query(&self, _: &mut ObserverContext<'_>, _: &mut Vec<Request>) -> Result<()> {
         Ok(())
     }
 
@@ -84,7 +83,24 @@ pub trait QueryObserver: Coprocessor {
     fn pre_apply_query(&self, _: &mut ObserverContext<'_>, _: &[Request]) {}
 
     /// Hook to call after applying write request.
-    fn post_apply_query(&self, _: &mut ObserverContext<'_>, _: &mut RepeatedField<Response>) {}
+    fn post_apply_query(&self, _: &mut ObserverContext<'_>, _: &mut Vec<Response>) {}
+}
+
+pub trait ApplySnapshotObserver: Coprocessor {
+    /// Hook to call before applying key from plain file.
+    /// This may be invoked multiple times for each plain file, and each time a batch of key-value
+    /// pairs will be passed to the function.
+    fn pre_apply_plain_kvs(
+        &self,
+        _: &mut ObserverContext<'_>,
+        _: CfName,
+        _: &[(Vec<u8>, Vec<u8>)],
+    ) {
+    }
+
+    /// Hook to call before applying sst file. Currently the content of the snapshot can't be
+    /// passed to the observer.
+    fn pre_apply_sst(&self, _: &mut ObserverContext<'_>, _: CfName, _path: &str) {}
 }
 
 /// SplitChecker is invoked during a split check scan, and decides to use
@@ -114,7 +130,7 @@ pub trait SplitCheckObserver: Coprocessor {
     fn add_checker(
         &self,
         _: &mut ObserverContext<'_>,
-        _: &mut SplitCheckerHost,
+        _: &mut SplitCheckerHost<'_>,
         _: &DB,
         policy: CheckPolicy,
     );

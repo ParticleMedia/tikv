@@ -1,6 +1,6 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::raftstore::store::{keys, CasualMessage, CasualRouter};
+use crate::raftstore::store::{CasualMessage, CasualRouter};
 use engine::rocks::DB;
 use engine::rocks::{self, Range};
 use engine::util;
@@ -82,23 +82,12 @@ impl SplitChecker for Checker {
 }
 
 pub struct KeysCheckObserver<C> {
-    region_max_keys: u64,
-    split_keys: u64,
-    batch_split_limit: u64,
     router: Mutex<C>,
 }
 
 impl<C: CasualRouter> KeysCheckObserver<C> {
-    pub fn new(
-        region_max_keys: u64,
-        split_keys: u64,
-        batch_split_limit: u64,
-        router: C,
-    ) -> KeysCheckObserver<C> {
+    pub fn new(router: C) -> KeysCheckObserver<C> {
         KeysCheckObserver {
-            region_max_keys,
-            split_keys,
-            batch_split_limit,
             router: Mutex::new(router),
         }
     }
@@ -126,9 +115,9 @@ impl<C: CasualRouter + Send> SplitCheckObserver for KeysCheckObserver<C> {
                 );
                 // Need to check keys.
                 host.add_checker(Box::new(Checker::new(
-                    self.region_max_keys,
-                    self.split_keys,
-                    self.batch_split_limit,
+                    host.cfg.region_max_keys,
+                    host.cfg.region_split_keys,
+                    host.cfg.batch_split_limit,
                     policy,
                 )));
                 return;
@@ -145,18 +134,18 @@ impl<C: CasualRouter + Send> SplitCheckObserver for KeysCheckObserver<C> {
         }
 
         REGION_KEYS_HISTOGRAM.observe(region_keys as f64);
-        if region_keys >= self.region_max_keys {
+        if region_keys >= host.cfg.region_max_keys {
             info!(
                 "approximate keys over threshold, need to do split check";
                 "region_id" => region.get_id(),
                 "keys" => region_keys,
-                "threshold" => self.region_max_keys,
+                "threshold" => host.cfg.region_max_keys,
             );
             // Need to check keys.
             host.add_checker(Box::new(Checker::new(
-                self.region_max_keys,
-                self.split_keys,
-                self.batch_split_limit,
+                host.cfg.region_max_keys,
+                host.cfg.region_split_keys,
+                host.cfg.batch_split_limit,
                 policy,
             )));
         } else {
@@ -165,7 +154,7 @@ impl<C: CasualRouter + Send> SplitCheckObserver for KeysCheckObserver<C> {
                 "approximate keys less than threshold, does not need to do split check";
                 "region_id" => region.get_id(),
                 "keys" => region_keys,
-                "threshold" => self.region_max_keys,
+                "threshold" => host.cfg.region_max_keys,
             );
         }
     }
@@ -176,9 +165,7 @@ pub fn get_region_approximate_keys(db: &DB, region: &Region) -> Result<u64> {
     // try to get from RangeProperties first.
     match get_region_approximate_keys_cf(db, CF_WRITE, region) {
         Ok(v) => {
-            if v > 0 {
-                return Ok(v);
-            }
+            return Ok(v);
         }
         Err(e) => debug!(
             "failed to get keys from RangeProperties";
@@ -217,9 +204,8 @@ mod tests {
         MvccPropertiesCollectorFactory, RangePropertiesCollectorFactory,
     };
     use crate::raftstore::coprocessor::{Config, CoprocessorHost};
-    use crate::raftstore::store::{keys, CasualMessage, SplitCheckRunner, SplitCheckTask};
-    use crate::storage::mvcc::{Write, WriteType};
-    use crate::storage::Key;
+    use crate::raftstore::store::{CasualMessage, SplitCheckRunner, SplitCheckTask};
+    use crate::storage::mvcc::{TimeStamp, Write, WriteType};
     use engine::rocks;
     use engine::rocks::util::{new_engine_opt, CFOptions};
     use engine::rocks::{ColumnFamilyOptions, DBOptions, Writable};
@@ -230,8 +216,9 @@ mod tests {
     use std::cmp;
     use std::sync::{mpsc, Arc};
     use std::u64;
-    use tempdir::TempDir;
+    use tempfile::Builder;
     use tikv_util::worker::Runnable;
+    use txn_types::Key;
 
     use super::*;
 
@@ -239,10 +226,15 @@ mod tests {
         let write_cf = engine.cf_handle(CF_WRITE).unwrap();
         let default_cf = engine.cf_handle(CF_DEFAULT).unwrap();
         let write_value = if fill_short_value {
-            Write::new(WriteType::Put, 0, Some(b"shortvalue".to_vec()))
+            Write::new(
+                WriteType::Put,
+                TimeStamp::zero(),
+                Some(b"shortvalue".to_vec()),
+            )
         } else {
-            Write::new(WriteType::Put, 0, None)
+            Write::new(WriteType::Put, TimeStamp::zero(), None)
         }
+        .as_ref()
         .to_bytes();
 
         while start_idx < end_idx {
@@ -250,7 +242,7 @@ mod tests {
             for i in start_idx..batch_idx {
                 let key = keys::data_key(
                     Key::from_raw(format!("{:04}", i).as_bytes())
-                        .append_ts(2)
+                        .append_ts(2.into())
                         .as_encoded(),
                 );
                 engine.put_cf(write_cf, &key, &write_value).unwrap();
@@ -265,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_split_check() {
-        let path = TempDir::new("test-raftstore").unwrap();
+        let path = Builder::new().prefix("test-raftstore").tempdir().unwrap();
         let path_str = path.path().to_str().unwrap();
         let db_opts = DBOptions::new();
         let mut cf_opts = ColumnFamilyOptions::new();
@@ -278,11 +270,11 @@ mod tests {
             .collect();
         let engine = Arc::new(new_engine_opt(path_str, db_opts, cfs_opts).unwrap());
 
-        let mut region = Region::new();
+        let mut region = Region::default();
         region.set_id(1);
         region.set_start_key(vec![]);
         region.set_end_key(vec![]);
-        region.mut_peers().push(Peer::new());
+        region.mut_peers().push(Peer::default());
         region.mut_region_epoch().set_version(2);
         region.mut_region_epoch().set_conf_ver(5);
 
@@ -295,12 +287,17 @@ mod tests {
         let mut runnable = SplitCheckRunner::new(
             Arc::clone(&engine),
             tx.clone(),
-            Arc::new(CoprocessorHost::new(cfg, tx.clone())),
+            Arc::new(CoprocessorHost::new(tx)),
+            cfg,
         );
 
         // so split key will be z0080
         put_data(&engine, 0, 90, false);
-        runnable.run(SplitCheckTask::new(region.clone(), true, CheckPolicy::SCAN));
+        runnable.run(SplitCheckTask::split_check(
+            region.clone(),
+            true,
+            CheckPolicy::Scan,
+        ));
         // keys has not reached the max_keys 100 yet.
         match rx.try_recv() {
             Ok((region_id, CasualMessage::RegionApproximateSize { .. }))
@@ -311,53 +308,68 @@ mod tests {
         }
 
         put_data(&engine, 90, 160, true);
-        runnable.run(SplitCheckTask::new(region.clone(), true, CheckPolicy::SCAN));
+        runnable.run(SplitCheckTask::split_check(
+            region.clone(),
+            true,
+            CheckPolicy::Scan,
+        ));
         must_split_at(
             &rx,
             &region,
-            vec![Key::from_raw(b"0080").append_ts(2).into_encoded()],
+            vec![Key::from_raw(b"0080").append_ts(2.into()).into_encoded()],
         );
 
         put_data(&engine, 160, 300, false);
-        runnable.run(SplitCheckTask::new(region.clone(), true, CheckPolicy::SCAN));
+        runnable.run(SplitCheckTask::split_check(
+            region.clone(),
+            true,
+            CheckPolicy::Scan,
+        ));
         must_split_at(
             &rx,
             &region,
             vec![
-                Key::from_raw(b"0080").append_ts(2).into_encoded(),
-                Key::from_raw(b"0160").append_ts(2).into_encoded(),
-                Key::from_raw(b"0240").append_ts(2).into_encoded(),
+                Key::from_raw(b"0080").append_ts(2.into()).into_encoded(),
+                Key::from_raw(b"0160").append_ts(2.into()).into_encoded(),
+                Key::from_raw(b"0240").append_ts(2.into()).into_encoded(),
             ],
         );
 
         put_data(&engine, 300, 500, false);
-        runnable.run(SplitCheckTask::new(region.clone(), true, CheckPolicy::SCAN));
+        runnable.run(SplitCheckTask::split_check(
+            region.clone(),
+            true,
+            CheckPolicy::Scan,
+        ));
         must_split_at(
             &rx,
             &region,
             vec![
-                Key::from_raw(b"0080").append_ts(2).into_encoded(),
-                Key::from_raw(b"0160").append_ts(2).into_encoded(),
-                Key::from_raw(b"0240").append_ts(2).into_encoded(),
-                Key::from_raw(b"0320").append_ts(2).into_encoded(),
-                Key::from_raw(b"0400").append_ts(2).into_encoded(),
+                Key::from_raw(b"0080").append_ts(2.into()).into_encoded(),
+                Key::from_raw(b"0160").append_ts(2.into()).into_encoded(),
+                Key::from_raw(b"0240").append_ts(2.into()).into_encoded(),
+                Key::from_raw(b"0320").append_ts(2.into()).into_encoded(),
+                Key::from_raw(b"0400").append_ts(2.into()).into_encoded(),
             ],
         );
 
         drop(rx);
         // It should be safe even the result can't be sent back.
-        runnable.run(SplitCheckTask::new(region, true, CheckPolicy::SCAN));
+        runnable.run(SplitCheckTask::split_check(region, true, CheckPolicy::Scan));
     }
 
     #[test]
     fn test_region_approximate_keys() {
-        let path = TempDir::new("_test_region_approximate_keys").expect("");
+        let path = Builder::new()
+            .prefix("_test_region_approximate_keys")
+            .tempdir()
+            .unwrap();
         let path_str = path.path().to_str().unwrap();
         let db_opts = DBOptions::new();
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let f = Box::new(MvccPropertiesCollectorFactory::default());
-        cf_opts.add_table_properties_collector_factory("tikv.mvcc-properties-collector", f);
+        let f = Box::new(RangePropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
         let cfs_opts = LARGE_CFS
             .iter()
             .map(|cf| CFOptions::new(cf, cf_opts.clone()))
@@ -366,8 +378,14 @@ mod tests {
 
         let cases = [("a", 1024), ("b", 2048), ("c", 4096)];
         for &(key, vlen) in &cases {
-            let key = keys::data_key(Key::from_raw(key.as_bytes()).append_ts(2).as_encoded());
-            let write_v = Write::new(WriteType::Put, 0, None).to_bytes();
+            let key = keys::data_key(
+                Key::from_raw(key.as_bytes())
+                    .append_ts(2.into())
+                    .as_encoded(),
+            );
+            let write_v = Write::new(WriteType::Put, TimeStamp::zero(), None)
+                .as_ref()
+                .to_bytes();
             let write_cf = db.cf_handle(CF_WRITE).unwrap();
             db.put_cf(write_cf, &key, &write_v).unwrap();
             db.flush_cf(write_cf, true).unwrap();
@@ -378,9 +396,68 @@ mod tests {
             db.flush_cf(default_cf, true).unwrap();
         }
 
-        let mut region = Region::new();
-        region.mut_peers().push(Peer::new());
+        let mut region = Region::default();
+        region.mut_peers().push(Peer::default());
         let range_keys = get_region_approximate_keys(&db, &region).unwrap();
         assert_eq!(range_keys, cases.len() as u64);
+    }
+
+    #[test]
+    fn test_region_approximate_keys_sub_region() {
+        let path = Builder::new()
+            .prefix("_test_region_approximate_keys_sub_region")
+            .tempdir()
+            .unwrap();
+        let path_str = path.path().to_str().unwrap();
+        let db_opts = DBOptions::new();
+        let mut cf_opts = ColumnFamilyOptions::new();
+        cf_opts.set_level_zero_file_num_compaction_trigger(10);
+        let f = Box::new(MvccPropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.mvcc-properties-collector", f);
+        let f = Box::new(RangePropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
+        let cfs_opts = LARGE_CFS
+            .iter()
+            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
+            .collect();
+        let db = rocks::util::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
+
+        let write_cf = db.cf_handle(CF_WRITE).unwrap();
+        let default_cf = db.cf_handle(CF_DEFAULT).unwrap();
+        // size >= 4194304 will insert a new point in range properties
+        // 3 points will be inserted into range properties
+        let cases = [("a", 4194304), ("b", 4194304), ("c", 4194304)];
+        for &(key, vlen) in &cases {
+            let key = keys::data_key(
+                Key::from_raw(key.as_bytes())
+                    .append_ts(2.into())
+                    .as_encoded(),
+            );
+            let write_v = Write::new(WriteType::Put, TimeStamp::zero(), None)
+                .as_ref()
+                .to_bytes();
+            db.put_cf(write_cf, &key, &write_v).unwrap();
+
+            let default_v = vec![0; vlen as usize];
+            db.put_cf(default_cf, &key, &default_v).unwrap();
+        }
+        // only flush once, so that mvcc properties will insert one point only
+        db.flush_cf(write_cf, true).unwrap();
+        db.flush_cf(default_cf, true).unwrap();
+
+        // range properties get 0, mvcc properties get 3
+        let mut region = Region::default();
+        region.set_id(1);
+        region.set_start_key(b"b1".to_vec());
+        region.set_end_key(b"b2".to_vec());
+        region.mut_peers().push(Peer::default());
+        let range_keys = get_region_approximate_keys(&db, &region).unwrap();
+        assert_eq!(range_keys, 0);
+
+        // range properties get 1, mvcc properties get 3
+        region.set_start_key(b"a".to_vec());
+        region.set_end_key(b"c".to_vec());
+        let range_keys = get_region_approximate_keys(&db, &region).unwrap();
+        assert_eq!(range_keys, 1);
     }
 }

@@ -13,15 +13,16 @@ use grpcio::{
 };
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::raft_serverpb::{Done, SnapshotChunk};
-use kvproto::tikvpb_grpc::TikvClient;
+use kvproto::tikvpb::TikvClient;
 
+use crate::raftstore::router::RaftStoreRouter;
 use crate::raftstore::store::{SnapEntry, SnapKey, SnapManager, Snapshot};
+use engine_rocks::RocksEngine;
 use tikv_util::security::SecurityManager;
 use tikv_util::worker::Runnable;
 use tikv_util::DeferContext;
 
 use super::metrics::*;
-use super::transport::RaftStoreRouter;
 use super::{Config, Error, Result};
 
 pub type Callback = Box<dyn FnOnce(Result<()>) + Send>;
@@ -54,7 +55,7 @@ impl Display for Task {
 
 struct SnapChunk {
     first: Option<SnapshotChunk>,
-    snap: Box<dyn Snapshot>,
+    snap: Box<dyn Snapshot<RocksEngine>>,
     remain_bytes: usize,
 }
 
@@ -79,7 +80,7 @@ impl Stream for SnapChunk {
         match result {
             Ok(_) => {
                 self.remain_bytes -= buf.len();
-                let mut chunk = SnapshotChunk::new();
+                let mut chunk = SnapshotChunk::default();
                 chunk.set_data(buf);
                 Ok(Async::Ready(Some((
                     chunk,
@@ -102,7 +103,7 @@ struct SendStat {
 /// It will first send the normal raft snapshot message and then send the snapshot file.
 fn send_snap(
     env: Arc<Environment>,
-    mgr: SnapManager,
+    mgr: SnapManager<RocksEngine>,
     security_mgr: Arc<SecurityManager>,
     cfg: &Config,
     addr: &str,
@@ -131,7 +132,7 @@ fn send_snap(
     let total_size = s.total_size()?;
 
     let chunks = {
-        let mut first_chunk = SnapshotChunk::new();
+        let mut first_chunk = SnapshotChunk::default();
         first_chunk.set_message(msg);
 
         SnapChunk {
@@ -176,12 +177,12 @@ fn send_snap(
 
 struct RecvSnapContext {
     key: SnapKey,
-    file: Option<Box<dyn Snapshot>>,
+    file: Option<Box<dyn Snapshot<RocksEngine>>>,
     raft_msg: RaftMessage,
 }
 
 impl RecvSnapContext {
-    fn new(head_chunk: Option<SnapshotChunk>, snap_mgr: &SnapManager) -> Result<Self> {
+    fn new(head_chunk: Option<SnapshotChunk>, snap_mgr: &SnapManager<RocksEngine>) -> Result<Self> {
         // head_chunk is None means the stream is empty.
         let mut head = head_chunk.ok_or_else(|| Error::Other("empty gRPC stream".into()))?;
         if !head.has_message() {
@@ -237,7 +238,7 @@ impl RecvSnapContext {
 fn recv_snap<R: RaftStoreRouter + 'static>(
     stream: RequestStream<SnapshotChunk>,
     sink: ClientStreamingSink<Done>,
-    snap_mgr: SnapManager,
+    snap_mgr: SnapManager<RocksEngine>,
     raft_router: R,
 ) -> impl Future<Item = (), Error = Error> {
     let stream = stream.map_err(Error::from);
@@ -281,9 +282,9 @@ fn recv_snap<R: RaftStoreRouter + 'static>(
         },
     );
     f.then(move |res| match res {
-        Ok(()) => sink.success(Done::new()),
+        Ok(()) => sink.success(Done::default()),
         Err(e) => {
-            let status = RpcStatus::new(RpcStatusCode::Unknown, Some(format!("{:?}", e)));
+            let status = RpcStatus::new(RpcStatusCode::UNKNOWN, Some(format!("{:?}", e)));
             sink.fail(status)
         }
     })
@@ -292,7 +293,7 @@ fn recv_snap<R: RaftStoreRouter + 'static>(
 
 pub struct Runner<R: RaftStoreRouter + 'static> {
     env: Arc<Environment>,
-    snap_mgr: SnapManager,
+    snap_mgr: SnapManager<RocksEngine>,
     pool: CpuPool,
     raft_router: R,
     security_mgr: Arc<SecurityManager>,
@@ -304,7 +305,7 @@ pub struct Runner<R: RaftStoreRouter + 'static> {
 impl<R: RaftStoreRouter + 'static> Runner<R> {
     pub fn new(
         env: Arc<Environment>,
-        snap_mgr: SnapManager,
+        snap_mgr: SnapManager<RocksEngine>,
         r: R,
         security_mgr: Arc<SecurityManager>,
         cfg: Arc<Config>,
@@ -329,10 +330,16 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
     fn run(&mut self, task: Task) {
         match task {
             Task::Recv { stream, sink } => {
-                if self.recving_count.load(Ordering::SeqCst) >= self.cfg.concurrent_recv_snap_limit
-                {
+                let task_num = self.recving_count.load(Ordering::SeqCst);
+                if task_num >= self.cfg.concurrent_recv_snap_limit {
                     warn!("too many recving snapshot tasks, ignore");
-                    let status = RpcStatus::new(RpcStatusCode::ResourceExhausted, None);
+                    let status = RpcStatus::new(
+                        RpcStatusCode::RESOURCE_EXHAUSTED,
+                        Some(format!(
+                            "the number of received snapshot tasks {} exceeded the limitation {}",
+                            task_num, self.cfg.concurrent_recv_snap_limit
+                        )),
+                    );
                     self.pool.spawn(sink.fail(status)).forget();
                     return;
                 }
@@ -352,6 +359,7 @@ impl<R: RaftStoreRouter + 'static> Runnable<Task> for Runner<R> {
                 self.pool.spawn(f).forget();
             }
             Task::Send { addr, msg, cb } => {
+                fail_point!("send_snapshot");
                 if self.sending_count.load(Ordering::SeqCst) >= self.cfg.concurrent_send_snap_limit
                 {
                     warn!(

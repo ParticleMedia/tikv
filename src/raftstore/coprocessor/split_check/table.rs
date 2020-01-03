@@ -7,12 +7,9 @@ use engine::CF_WRITE;
 use engine::{IterOption, Iterable};
 use kvproto::metapb::Region;
 use kvproto::pdpb::CheckPolicy;
-
-use crate::coprocessor::codec::table as table_codec;
-use crate::raftstore::store::keys;
-use crate::storage::types::Key;
-use tikv_util::escape;
+use tidb_query::codec::table as table_codec;
 use tikv_util::keybuilder::KeyBuilder;
+use txn_types::Key;
 
 use super::super::{
     Coprocessor, KeyEntry, ObserverContext, Result, SplitCheckObserver, SplitChecker,
@@ -82,6 +79,9 @@ impl SplitCheckObserver for TableCheckObserver {
         engine: &DB,
         policy: CheckPolicy,
     ) {
+        if !host.cfg.split_region_on_table {
+            return;
+        }
         let region = ctx.region();
         if is_same_table(region.get_start_key(), region.get_end_key()) {
             // Region is inside a table, skip for saving IO.
@@ -155,9 +155,9 @@ impl SplitCheckObserver for TableCheckObserver {
                 first_encoded_table_prefix = to_encoded_table_prefix(encoded_start_key);
             }
             _ => panic!(
-                "start_key {:?} and end_key {:?} out of order",
-                escape(encoded_start_key),
-                escape(encoded_end_key)
+                "start_key {} and end_key {} out of order",
+                hex::encode_upper(encoded_start_key),
+                hex::encode_upper(encoded_end_key)
             ),
         }
         host.add_checker(Box::new(Checker {
@@ -181,7 +181,8 @@ fn last_key_of_region(db: &DB, region: &Region) -> Result<Option<Vec<u8>>> {
     let mut iter = box_try!(db.new_iterator_cf(CF_WRITE, iter_opt));
 
     // the last key
-    if iter.seek(SeekKey::End) {
+    let found: Result<bool> = iter.seek(SeekKey::End).map_err(|e| box_err!(e));
+    if found? {
         let key = iter.key().to_vec();
         last_key = Some(key);
     } // else { No data in this CF }
@@ -225,17 +226,17 @@ mod tests {
 
     use kvproto::metapb::Peer;
     use kvproto::pdpb::CheckPolicy;
-    use tempdir::TempDir;
+    use tempfile::Builder;
 
-    use crate::coprocessor::codec::table::{TABLE_PREFIX, TABLE_PREFIX_KEY_LEN};
     use crate::raftstore::store::{CasualMessage, SplitCheckRunner, SplitCheckTask};
-    use crate::storage::types::Key;
     use engine::rocks::util::new_engine;
     use engine::rocks::Writable;
     use engine::ALL_CFS;
+    use tidb_query::codec::table::{TABLE_PREFIX, TABLE_PREFIX_KEY_LEN};
     use tikv_util::codec::number::NumberEncoder;
     use tikv_util::config::ReadableSize;
     use tikv_util::worker::Runnable;
+    use txn_types::Key;
 
     use super::*;
     use crate::raftstore::coprocessor::{Config, CoprocessorHost};
@@ -251,14 +252,17 @@ mod tests {
 
     #[test]
     fn test_last_key_of_region() {
-        let path = TempDir::new("test_last_key_of_region").unwrap();
+        let path = Builder::new()
+            .prefix("test_last_key_of_region")
+            .tempdir()
+            .unwrap();
         let engine =
             Arc::new(new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap());
         let write_cf = engine.cf_handle(CF_WRITE).unwrap();
 
-        let mut region = Region::new();
+        let mut region = Region::default();
         region.set_id(1);
-        region.mut_peers().push(Peer::new());
+        region.mut_peers().push(Peer::default());
 
         // arbitrary padding.
         let padding = b"_r00000005";
@@ -303,14 +307,17 @@ mod tests {
 
     #[test]
     fn test_table_check_observer() {
-        let path = TempDir::new("test_table_check_observer").unwrap();
+        let path = Builder::new()
+            .prefix("test_table_check_observer")
+            .tempdir()
+            .unwrap();
         let engine =
             Arc::new(new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap());
         let write_cf = engine.cf_handle(CF_WRITE).unwrap();
 
-        let mut region = Region::new();
+        let mut region = Region::default();
         region.set_id(1);
-        region.mut_peers().push(Peer::new());
+        region.mut_peers().push(Peer::default());
         region.mut_region_epoch().set_version(2);
         region.mut_region_epoch().set_conf_ver(5);
 
@@ -328,29 +335,44 @@ mod tests {
         cfg.region_max_keys = 2000000000;
         cfg.region_split_keys = 1000000000;
         // Try to ignore the ApproximateRegionSize
-        let coprocessor = CoprocessorHost::new(cfg, stx);
+        let coprocessor = CoprocessorHost::new(stx);
         let mut runnable =
-            SplitCheckRunner::new(Arc::clone(&engine), tx.clone(), Arc::new(coprocessor));
+            SplitCheckRunner::new(Arc::clone(&engine), tx, Arc::new(coprocessor), cfg);
 
         type Case = (Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>);
         let mut check_cases = |cases: Vec<Case>| {
             for (encoded_start_key, encoded_end_key, table_id) in cases {
                 region.set_start_key(encoded_start_key.unwrap_or_else(Vec::new));
                 region.set_end_key(encoded_end_key.unwrap_or_else(Vec::new));
-                runnable.run(SplitCheckTask::new(region.clone(), true, CheckPolicy::SCAN));
+                runnable.run(SplitCheckTask::split_check(
+                    region.clone(),
+                    true,
+                    CheckPolicy::Scan,
+                ));
 
                 if let Some(id) = table_id {
                     let key = Key::from_raw(&gen_table_prefix(id));
-                    match rx.try_recv() {
-                        Ok((_, CasualMessage::SplitRegion { split_keys, .. })) => {
-                            assert_eq!(split_keys, vec![key.into_encoded()]);
+                    loop {
+                        match rx.try_recv() {
+                            Ok((_, CasualMessage::RegionApproximateSize { .. }))
+                            | Ok((_, CasualMessage::RegionApproximateKeys { .. })) => (),
+                            Ok((_, CasualMessage::SplitRegion { split_keys, .. })) => {
+                                assert_eq!(split_keys, vec![key.into_encoded()]);
+                                break;
+                            }
+                            others => panic!("expect {:?}, but got {:?}", key, others),
                         }
-                        others => panic!("expect {:?}, but got {:?}", key, others),
                     }
                 } else {
-                    match rx.try_recv() {
-                        Err(mpsc::TryRecvError::Empty) => (),
-                        others => panic!("expect empty, but got {:?}", others),
+                    loop {
+                        match rx.try_recv() {
+                            Ok((_, CasualMessage::RegionApproximateSize { .. }))
+                            | Ok((_, CasualMessage::RegionApproximateKeys { .. })) => (),
+                            Err(mpsc::TryRecvError::Empty) => {
+                                break;
+                            }
+                            others => panic!("expect empty, but got {:?}", others),
+                        }
                     }
                 }
             }

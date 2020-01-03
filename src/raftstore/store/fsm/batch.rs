@@ -55,7 +55,7 @@ enum FsmTypes<N, C> {
 
 // A macro to introduce common definition of scheduler.
 macro_rules! impl_sched {
-    ($name:ident) => {
+    ($name:ident, $ty:path, Fsm = $fsm:tt) => {
         pub struct $name<N, C> {
             sender: channel::Sender<FsmTypes<N, C>>,
         }
@@ -68,52 +68,36 @@ macro_rules! impl_sched {
                 }
             }
         }
+
+        impl<N, C> FsmScheduler for $name<N, C>
+        where
+            $fsm: Fsm,
+        {
+            type Fsm = $fsm;
+
+            #[inline]
+            fn schedule(&self, fsm: Box<Self::Fsm>) {
+                match self.sender.send($ty(fsm)) {
+                    Ok(()) => {}
+                    // TODO: use debug instead.
+                    Err(SendError($ty(fsm))) => warn!("failed to schedule fsm {:p}", fsm),
+                    _ => unreachable!(),
+                }
+            }
+
+            fn shutdown(&self) {
+                // TODO: close it explicitly once it's supported.
+                // Magic number, actually any number greater than poll pool size works.
+                for _ in 0..100 {
+                    let _ = self.sender.send(FsmTypes::Empty);
+                }
+            }
+        }
     };
 }
 
-impl_sched!(NormalScheduler);
-impl_sched!(ControlScheduler);
-
-impl<N: Fsm, C> FsmScheduler for NormalScheduler<N, C> {
-    type Fsm = N;
-
-    #[inline]
-    fn schedule(&self, fsm: Box<N>) {
-        match self.sender.send(FsmTypes::Normal(fsm)) {
-            Ok(()) => return,
-            // TODO: use debug instead.
-            Err(SendError(FsmTypes::Normal(fsm))) => warn!("failed to schedule fsm {:p}", fsm),
-            _ => unreachable!(),
-        }
-    }
-
-    fn shutdown(&self) {
-        // TODO: close it explicitly once it's supported.
-        // Magic number, actually any number greater than poll pool size works.
-        for _ in 0..100 {
-            let _ = self.sender.send(FsmTypes::Empty);
-        }
-    }
-}
-
-impl<N, C: Fsm> FsmScheduler for ControlScheduler<N, C> {
-    type Fsm = C;
-
-    #[inline]
-    fn schedule(&self, fsm: Box<C>) {
-        match self.sender.send(FsmTypes::Control(fsm)) {
-            Ok(()) => return,
-            Err(SendError(FsmTypes::Control(fsm))) => warn!("failed to schedule fsm {:p}", fsm),
-            _ => unreachable!(),
-        }
-    }
-
-    fn shutdown(&self) {
-        for _ in 0..100 {
-            let _ = self.sender.send(FsmTypes::Empty);
-        }
-    }
-}
+impl_sched!(NormalScheduler, FsmTypes::Normal, Fsm = N);
+impl_sched!(ControlScheduler, FsmTypes::Control, Fsm = C);
 
 /// A basic struct for a round of polling.
 #[allow(clippy::vec_box)]
@@ -268,6 +252,9 @@ pub trait PollHandler<N, C> {
 
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
+
+    /// This function is called when batch system is going to sleep.
+    fn pause(&mut self) {}
 }
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
@@ -279,7 +266,7 @@ struct Poller<N: Fsm, C: Fsm, Handler> {
 }
 
 impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
-    fn fetch_batch(&self, batch: &mut Batch<N, C>, max_size: usize) {
+    fn fetch_batch(&mut self, batch: &mut Batch<N, C>, max_size: usize) {
         let curr_batch_len = batch.len();
         if batch.control.is_some() || curr_batch_len >= max_size {
             // Do nothing if there's a pending control fsm or the batch is already full.
@@ -287,8 +274,11 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         }
 
         let mut pushed = if curr_batch_len == 0 {
-            // Block if the batch is empty.
-            match self.fsm_receiver.recv() {
+            match self.fsm_receiver.try_recv().or_else(|_| {
+                self.handler.pause();
+                // Block if the batch is empty.
+                self.fsm_receiver.recv()
+            }) {
                 Ok(fsm) => batch.push(fsm),
                 Err(_) => return,
             }
@@ -483,7 +473,6 @@ pub mod tests {
         }
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn new_runner(cap: usize) -> (mpsc::LooseBoundedSender<Message>, Box<Runner>) {
         let (tx, rx) = mpsc::loose_bounded(cap);
         let fsm = Runner {
@@ -578,17 +567,16 @@ pub mod tests {
             .send_control(Some(Box::new(move |_: &mut Runner| {
                 let (tx, runner) = new_runner(10);
                 let mailbox = BasicMailbox::new(tx, runner);
-                tx_.send(1).unwrap();
                 r.register(1, mailbox);
+                tx_.send(1).unwrap();
             })))
             .unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(1));
-        let tx_ = tx.clone();
         router
             .send(
                 1,
                 Some(Box::new(move |_: &mut Runner| {
-                    tx_.send(2).unwrap();
+                    tx.send(2).unwrap();
                 })),
             )
             .unwrap();

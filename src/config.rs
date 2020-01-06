@@ -156,6 +156,7 @@ macro_rules! cf_config {
         #[serde(default)]
         #[serde(rename_all = "kebab-case")]
         pub struct $name {
+            pub ttl: i32,
             pub block_size: ReadableSize,
             pub block_cache_size: ReadableSize,
             pub disable_block_cache: bool,
@@ -427,6 +428,7 @@ impl Default for DefaultCfConfig {
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
             enable_doubly_skiplist: true,
             titan: TitanCfConfig::default(),
+            ttl: 0,
         }
     }
 }
@@ -494,6 +496,7 @@ impl Default for WriteCfConfig {
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
             enable_doubly_skiplist: true,
             titan,
+            ttl: 0,
         }
     }
 }
@@ -563,6 +566,7 @@ impl Default for LockCfConfig {
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
             enable_doubly_skiplist: true,
             titan,
+            ttl: 0,
         }
     }
 }
@@ -622,6 +626,7 @@ impl Default for RaftCfConfig {
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
             enable_doubly_skiplist: true,
             titan,
+            ttl: 0,
         }
     }
 }
@@ -815,7 +820,7 @@ impl DbConfig {
 
     pub fn build_cf_opts(&self, cache: &Option<Cache>) -> Vec<CFOptions<'_>> {
         vec![
-            CFOptions::new(CF_DEFAULT, self.defaultcf.build_opt(cache)),
+            CFOptions::new_with_ttl(CF_DEFAULT, self.defaultcf.build_opt(cache), self.defaultcf.ttl),
             CFOptions::new(CF_LOCK, self.lockcf.build_opt(cache)),
             CFOptions::new(CF_WRITE, self.writecf.build_opt(cache)),
             // TODO: remove CF_RAFT.
@@ -825,7 +830,7 @@ impl DbConfig {
 
     pub fn build_cf_opts_v2(&self, cache: &Option<Cache>) -> Vec<CFOptions<'_>> {
         vec![
-            CFOptions::new(CF_DEFAULT, self.defaultcf.build_opt(cache)),
+            CFOptions::new_with_ttl(CF_DEFAULT, self.defaultcf.build_opt(cache), self.defaultcf.ttl),
             CFOptions::new(CF_LOCK, self.lockcf.build_opt(cache)),
             CFOptions::new(CF_WRITE, self.writecf.build_opt(cache)),
             CFOptions::new(CF_RAFT, self.raftcf.build_opt(cache)),
@@ -904,6 +909,7 @@ impl Default for RaftDefaultCfConfig {
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
             enable_doubly_skiplist: true,
             titan: TitanCfConfig::default(),
+            ttl: 0,
         }
     }
 }
